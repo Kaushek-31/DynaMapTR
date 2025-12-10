@@ -1,0 +1,3 @@
+# ninja log v5
+0	6928	1764641885001189475	/home/bevfus_segmentation/BEVFormer_segmentation_detection/projects/mmdet3d_plugin/maptr/modules/ops/geometric_kernel_attn/build/temp.linux-x86_64-3.8/home/bevfus_segmentation/BEVFormer_segmentation_detection/projects/mmdet3d_plugin/maptr/modules/ops/geometric_kernel_attn/src/geometric_kernel_attn_cuda.o	17dba3cd365ae06d
+0	12985	1764641891053249146	/home/bevfus_segmentation/BEVFormer_segmentation_detection/projects/mmdet3d_plugin/maptr/modules/ops/geometric_kernel_attn/build/temp.linux-x86_64-3.8/home/bevfus_segmentation/BEVFormer_segmentation_detection/projects/mmdet3d_plugin/maptr/modules/ops/geometric_kernel_attn/src/version.o	5e322d505a18f289

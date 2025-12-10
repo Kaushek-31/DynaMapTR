@@ -1,0 +1,644 @@
+"""
+Complete PKL generator with CORRECT NuScenes category names and rotation matrices.
+FINAL VERSION - All bugs fixed.
+"""
+
+import pickle
+import argparse
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+
+from nuscenes.nuscenes import NuScenes
+from nuscenes.map_expansion.map_api import NuScenesMap
+from nuscenes.utils.splits import create_splits_scenes
+from pyquaternion import Quaternion
+
+import os
+
+
+# ============================================================
+# CORRECT NUSCENES CATEGORY NAMES
+# ============================================================
+NUSCENES_CLASS_NAMES = [
+    'car',
+    'truck', 
+    'construction_vehicle',
+    'bus',
+    'trailer',
+    'barrier',
+    'motorcycle',
+    'bicycle',
+    'pedestrian',
+    'traffic_cone'
+]
+
+# Mapping from NuScenes full category to our simplified names
+CATEGORY_MAPPING = {
+    # Vehicles
+    'vehicle.car': 'car',
+    'vehicle.truck': 'truck',
+    'vehicle.construction': 'construction_vehicle',
+    'vehicle.bus.bendy': 'bus',
+    'vehicle.bus.rigid': 'bus',
+    'vehicle.trailer': 'trailer',
+    'vehicle.motorcycle': 'motorcycle',
+    'vehicle.bicycle': 'bicycle',
+    
+    # Pedestrians (all types map to 'pedestrian')
+    'human.pedestrian.adult': 'pedestrian',
+    'human.pedestrian.child': 'pedestrian',
+    'human.pedestrian.construction_worker': 'pedestrian',
+    'human.pedestrian.police_officer': 'pedestrian',
+    
+    # Movable objects
+    'movable_object.barrier': 'barrier',
+    'movable_object.trafficcone': 'traffic_cone',
+}
+
+
+def quaternion_yaw(q: Quaternion) -> float:
+    """Get yaw angle from quaternion."""
+    return q.yaw_pitch_roll[0]
+
+
+# def generate_object_seg_mask(gt_boxes, gt_names, bev_size=(200, 400), pc_range=[-30.0, -15.0, -10.0, 30.0, 15.0, 10.0]):
+#     """
+#     Generate object segmentation mask from 3D bounding boxes.
+    
+#     Args:
+#         gt_boxes: (N, 7) array [x, y, z, w, l, h, yaw]
+#         gt_names: (N,) array of class names
+#         bev_size: (H, W) BEV grid size
+#         pc_range: [x_min, y_min, z_min, x_max, y_max, z_max]
+    
+#     Returns:
+#         mask: (H, W) uint8 array with class indices
+#     """
+#     H, W = bev_size
+#     mask = np.zeros((H, W), dtype=np.uint8)
+    
+#     if len(gt_boxes) == 0:
+#         return mask
+    
+#     # Class name to index mapping
+#     class_to_idx = {
+#         'car': 1, 'truck': 2, 'construction_vehicle': 3, 'bus': 4,
+#         'trailer': 5, 'barrier': 6, 'motorcycle': 7, 'bicycle': 8,
+#         'pedestrian': 9, 'traffic_cone': 10
+#     }
+    
+#     # BEV grid resolution
+#     x_min, y_min = pc_range[0], pc_range[1]
+#     x_max, y_max = pc_range[3], pc_range[4]
+#     x_res = (x_max - x_min) / W
+#     y_res = (y_max - y_min) / H
+    
+#     for box, name in zip(gt_boxes, gt_names):
+#         if name not in class_to_idx:
+#             continue
+        
+#         class_idx = class_to_idx[name]
+        
+#         # Extract box params
+#         x, y, z, w, l, h, yaw = box
+        
+#         # Create rotated box corners
+#         # Box corners in local frame (before rotation)
+#         corners_local = np.array([
+#             [-l/2, -w/2], [l/2, -w/2], [l/2, w/2], [-l/2, w/2]
+#         ])
+        
+#         # Rotation matrix
+#         cos_yaw = np.cos(yaw)
+#         sin_yaw = np.sin(yaw)
+#         rot_mat = np.array([[cos_yaw, -sin_yaw], [sin_yaw, cos_yaw]])
+        
+#         # Rotate and translate corners
+#         corners_global = (rot_mat @ corners_local.T).T + np.array([x, y])
+        
+#         # Convert to pixel coordinates
+#         pixel_coords = np.zeros_like(corners_global, dtype=np.int32)
+#         pixel_coords[:, 0] = ((corners_global[:, 0] - x_min) / x_res).astype(np.int32)  # X -> W
+#         pixel_coords[:, 1] = ((corners_global[:, 1] - y_min) / y_res).astype(np.int32)  # Y -> H
+        
+#         # Clip to valid range
+#         pixel_coords[:, 0] = np.clip(pixel_coords[:, 0], 0, W - 1)
+#         pixel_coords[:, 1] = np.clip(pixel_coords[:, 1], 0, H - 1)
+        
+#         # Fill polygon
+#         from PIL import Image, ImageDraw
+#         img = Image.fromarray(mask)
+#         draw = ImageDraw.Draw(img)
+#         polygon = [(int(x), int(y)) for x, y in pixel_coords]
+#         draw.polygon(polygon, fill=class_idx)
+#         mask = np.array(img)
+    
+#     return mask
+
+def generate_object_seg_mask(
+        gt_boxes, 
+        gt_names, 
+        bev_size=(200, 400), 
+        pc_range=[-30.0, -15.0, -10.0, 30.0, 15.0, 10.0]
+    ):
+    """
+    Generate object segmentation mask with 2 classes:
+        0 = background
+        1 = vehicles (car, truck, bus, trailer, construction_vehicle, motorcycle, bicycle)
+        2 = pedestrian
+    """
+
+    H, W = bev_size
+    mask = np.zeros((H, W), dtype=np.uint8)
+
+    if len(gt_boxes) == 0:
+        return mask
+
+    # ------------------------------
+    # NEW 2-CLASS SEGMENTATION LABELS
+    # ------------------------------
+    VEHICLE_CLASSES = {
+        'car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+        'motorcycle', 'bicycle'
+    }
+    PEDESTRIAN_CLASSES = {'pedestrian'}
+
+    # BEV grid resolution
+    x_min, y_min = pc_range[0], pc_range[1]
+    x_max, y_max = pc_range[3], pc_range[4]
+    x_res = (x_max - x_min) / W
+    y_res = (y_max - y_min) / H
+
+    for box, name in zip(gt_boxes, gt_names):
+
+        # ------------------------------
+        # Assign 2-class label
+        # ------------------------------
+        if name in VEHICLE_CLASSES:
+            class_idx = 1
+        elif name in PEDESTRIAN_CLASSES:
+            class_idx = 2
+        else:
+            continue   # all else = background (0)
+
+        # Extract box params
+        x, y, z, w, l, h, yaw = box
+
+        # Local corners before rotation
+        corners_local = np.array([
+            [-l / 2, -w / 2], [l / 2, -w / 2],
+            [l / 2, w / 2], [-l / 2, w / 2]
+        ])
+
+        # Rotation
+        cos_yaw = np.cos(yaw)
+        sin_yaw = np.sin(yaw)
+        rot_mat = np.array([[cos_yaw, -sin_yaw],
+                            [sin_yaw, cos_yaw]])
+
+        # Rotate + translate
+        corners_global = (rot_mat @ corners_local.T).T + np.array([x, y])
+
+        # Convert to pixel coordinates
+        px = ((corners_global[:, 0] - x_min) / x_res).astype(np.int32)
+        py = ((corners_global[:, 1] - y_min) / y_res).astype(np.int32)
+
+        px = np.clip(px, 0, W - 1)
+        py = np.clip(py, 0, H - 1)
+
+        # Draw polygon
+        from PIL import Image, ImageDraw
+        img = Image.fromarray(mask)
+        draw = ImageDraw.Draw(img)
+        polygon = [(int(px[i]), int(py[i])) for i in range(4)]
+        draw.polygon(polygon, fill=int(class_idx))
+        mask = np.array(img)
+
+    return mask
+
+
+def get_map_vectors_in_lidar(nusc, nusc_map, sample_token, pc_range=[-30.0, -15.0, -10.0, 30.0, 15.0, 10.0], verbose=False):
+    """Extract map vectors in LIDAR frame with CORRECT transformation."""
+    sample = nusc.get('sample', sample_token)
+    lidar_token = sample['data']['LIDAR_TOP']
+    lidar_data = nusc.get('sample_data', lidar_token)
+    ego_pose = nusc.get('ego_pose', lidar_data['ego_pose_token'])
+    calib = nusc.get('calibrated_sensor', lidar_data['calibrated_sensor_token'])
+    
+    # Get transformations
+    ego_translation = np.array(ego_pose['translation'])
+    ego_rotation = Quaternion(ego_pose['rotation']).rotation_matrix
+    lidar_translation = np.array(calib['translation'])
+    lidar_rotation = Quaternion(calib['rotation']).rotation_matrix
+    
+    # Build transforms
+    lidar2ego = np.eye(4)
+    lidar2ego[:3, :3] = lidar_rotation
+    lidar2ego[:3, 3] = lidar_translation
+    
+    ego2global = np.eye(4)
+    ego2global[:3, :3] = ego_rotation
+    ego2global[:3, 3] = ego_translation
+    
+    lidar2global = ego2global @ lidar2ego
+    
+    # CRITICAL FIX: Use global2lidar, not global2ego!
+    global2lidar = np.linalg.inv(lidar2global)
+    
+    if verbose:
+        print("\n=== TRANSFORMS ===")
+        print(f"ego_translation: {ego_translation}")
+        print(f"lidar_translation: {lidar_translation}")
+        print(f"lidar2global:\n{lidar2global}")
+        print(f"global2lidar:\n{global2lidar}")
+    
+    # Define patch around ego position in global frame
+    patch_box = (ego_translation[0], ego_translation[1], 60, 30)
+    
+    vectors = []
+    labels = []
+    
+    def transform_line(line_2d):
+        """Transform 2D line from global to lidar frame."""
+        n_pts = len(line_2d)
+        line_global_homo = np.column_stack([
+            line_2d[:, 0],           # X
+            line_2d[:, 1],           # Y
+            np.zeros(n_pts),         # Z = 0
+            np.ones(n_pts)           # homogeneous
+        ])
+        line_lidar_homo = (global2lidar @ line_global_homo.T).T
+        return line_lidar_homo[:, :2].astype(np.float32)
+    
+    def filter_to_range(line_lidar, pc_range):
+        """Filter points to be within pc_range."""
+        x_min, y_min = pc_range[0], pc_range[1]
+        x_max, y_max = pc_range[3], pc_range[4]
+        
+        # Keep points within range (with small margin)
+        mask = (
+            (line_lidar[:, 0] >= x_min - 5) & (line_lidar[:, 0] <= x_max + 5) &
+            (line_lidar[:, 1] >= y_min - 5) & (line_lidar[:, 1] <= y_max + 5)
+        )
+        
+        if mask.sum() < 2:
+            return None
+        
+        # Clip to exact range
+        line_clipped = line_lidar.copy()
+        line_clipped[:, 0] = np.clip(line_clipped[:, 0], x_min, x_max)
+        line_clipped[:, 1] = np.clip(line_clipped[:, 1], y_min, y_max)
+        
+        return line_clipped
+    
+    try:
+        # Lane dividers (class 0)
+        divider_tokens = nusc_map.get_records_in_patch(patch_box, ['lane_divider'], mode='intersect').get('lane_divider', [])
+        for token in divider_tokens:
+            record = nusc_map.get('lane_divider', token)
+            line = nusc_map.extract_line(record['line_token'])
+            if line is not None and len(line) > 1:
+                line_lidar = transform_line(np.array(line))
+                line_filtered = filter_to_range(line_lidar, pc_range)
+                if line_filtered is not None and len(line_filtered) > 1:
+                    vectors.append(line_filtered)
+                    labels.append(0)
+        
+        # Ped crossings (class 1)
+        ped_tokens = nusc_map.get_records_in_patch(patch_box, ['ped_crossing'], mode='intersect').get('ped_crossing', [])
+        for token in ped_tokens:
+            record = nusc_map.get('ped_crossing', token)
+            polygon = nusc_map.extract_polygon(record['polygon_token'])
+            if polygon is not None:
+                line = np.array(polygon.exterior.coords)
+                if len(line) > 2:
+                    line_lidar = transform_line(line[:, :2])
+                    line_filtered = filter_to_range(line_lidar, pc_range)
+                    if line_filtered is not None and len(line_filtered) > 1:
+                        vectors.append(line_filtered)
+                        labels.append(1)
+        
+        # Road boundaries (class 2)
+        road_tokens = nusc_map.get_records_in_patch(patch_box, ['road_segment'], mode='intersect').get('road_segment', [])
+        for token in road_tokens[:20]:  # Limit to avoid too many
+            record = nusc_map.get('road_segment', token)
+            polygon = nusc_map.extract_polygon(record['polygon_token'])
+            if polygon is not None:
+                line = np.array(polygon.exterior.coords)
+                if len(line) > 2:
+                    line_lidar = transform_line(line[:, :2])
+                    line_filtered = filter_to_range(line_lidar, pc_range)
+                    if line_filtered is not None and len(line_filtered) > 1:
+                        vectors.append(line_filtered)
+                        labels.append(2)
+                        
+    except Exception as e:
+        print(f"Warning: Error extracting map vectors: {e}")
+    
+    if verbose:
+        print(f"\nExtracted {len(vectors)} vectors")
+        if len(vectors) > 0:
+            all_pts = np.vstack(vectors)
+            print(f"Lidar range: X=[{all_pts[:, 0].min():.1f}, {all_pts[:, 0].max():.1f}], Y=[{all_pts[:, 1].min():.1f}, {all_pts[:, 1].max():.1f}]")
+    
+    return vectors, labels
+
+
+def create_nuscenes_infos(nusc, nusc_maps, scenes, args):
+    """Create complete info dicts with ALL required fields."""
+    
+    all_infos = []
+    
+    for scene_name in tqdm(scenes, desc="Processing scenes"):
+        # Find scene
+        scene_obj = None
+        for s in nusc.scene:
+            if s['name'] == scene_name:
+                scene_obj = s
+                break
+        
+        if scene_obj is None:
+            continue
+        
+        # Get location
+        log_record = nusc.get('log', scene_obj['log_token'])
+        location = log_record['location']
+        
+        if location not in nusc_maps:
+            print(f"Warning: No map for {location}, skipping scene {scene_name}")
+            continue
+        
+        nusc_map = nusc_maps[location]
+        
+        # Process all samples in scene
+        scene_infos = []
+        sample_token = scene_obj['first_sample_token']
+        
+        while sample_token:
+            sample = nusc.get('sample', sample_token)
+            
+            # Lidar data
+            lidar_token = sample['data']['LIDAR_TOP']
+            sd_rec = nusc.get('sample_data', lidar_token)
+            cs_record = nusc.get('calibrated_sensor', sd_rec['calibrated_sensor_token'])
+            pose_record = nusc.get('ego_pose', sd_rec['ego_pose_token'])
+            
+            # Create info dict
+            info = {
+                'token': sample['token'],
+                'sample_idx': sample['token'],
+                'scene_token': scene_obj['token'],
+                'scene_name': scene_obj['name'],
+                'timestamp': sample['timestamp'],
+                'location': location,
+                'map_location': location,
+                'frame_idx': len(scene_infos),
+                'prev': '',
+                'next': '',
+                'prev_bev_exists': False,
+                'lidar_path': os.path.join(args.dataroot, sd_rec['filename']),
+                'sweeps': [],
+                'lidar2ego_translation': cs_record['translation'],
+                'lidar2ego_rotation': cs_record['rotation'],
+                'ego2global_translation': pose_record['translation'],
+                'ego2global_rotation': pose_record['rotation'],
+                'cams': {},
+            }
+            
+            # CAN bus
+            rotation = Quaternion(pose_record['rotation'])
+            patch_angle = quaternion_yaw(rotation) / np.pi * 180
+            if patch_angle < 0:
+                patch_angle += 360
+            
+            info['can_bus'] = [
+                pose_record['translation'][0], pose_record['translation'][1], pose_record['translation'][2],
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, patch_angle
+            ]
+            
+            # ============================================================
+            # CAMERA DATA - FIXED WITH ROTATION MATRICES
+            # ============================================================
+            
+            # Get lidar2ego transform matrices (computed once, used for all cameras)
+            lidar2ego_rot = Quaternion(cs_record['rotation']).rotation_matrix
+            lidar2ego_trans = np.array(cs_record['translation'])
+            
+            # Inverse: ego2lidar
+            ego2lidar_rot = lidar2ego_rot.T  # Transpose = inverse for rotation matrices
+            ego2lidar_trans = -ego2lidar_rot @ lidar2ego_trans
+            
+            cam_names = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_FRONT_LEFT',
+                        'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT']
+            
+            for cam_name in cam_names:
+                cam_token = sample['data'][cam_name]
+                cam_sd_rec = nusc.get('sample_data', cam_token)
+                cam_cs_rec = nusc.get('calibrated_sensor', cam_sd_rec['calibrated_sensor_token'])
+                cam_pose_rec = nusc.get('ego_pose', cam_sd_rec['ego_pose_token'])
+                
+                # Camera to ego transform (as rotation matrix)
+                cam2ego_rot = Quaternion(cam_cs_rec['rotation']).rotation_matrix
+                cam2ego_trans = np.array(cam_cs_rec['translation'])
+                
+                # Camera to lidar: cam -> ego -> lidar
+                cam2lidar_rot = ego2lidar_rot @ cam2ego_rot
+                cam2lidar_trans = ego2lidar_rot @ cam2ego_trans + ego2lidar_trans
+                
+                info['cams'][cam_name] = {
+                    'data_path': os.path.join(args.dataroot, cam_sd_rec['filename']),
+                    'type': cam_name,
+                    'sample_data_token': cam_token,
+                    'sensor2ego_translation': cam_cs_rec['translation'],
+                    'sensor2ego_rotation': cam_cs_rec['rotation'],  # Keep as quaternion
+                    'ego2global_translation': cam_pose_rec['translation'],
+                    'ego2global_rotation': cam_pose_rec['rotation'],  # Keep as quaternion
+                    'timestamp': cam_sd_rec['timestamp'],
+                    
+                    # CRITICAL FIX: Store as 3x3 rotation MATRIX, not quaternion!
+                    'sensor2lidar_rotation': cam2lidar_rot,  # ← 3x3 numpy array
+                    'sensor2lidar_translation': cam2lidar_trans,  # ← 3D numpy array
+                    
+                    'cam_intrinsic': np.array(cam_cs_rec['camera_intrinsic']),
+                }
+            
+            # Map vectors
+            vectors, labels = get_map_vectors_in_lidar(nusc, nusc_map, sample['token'])
+            
+            if len(vectors) > 0:
+                info['vectors'] = vectors
+                info['labels'] = labels
+                info['gt_map_names'] = [['divider', 'ped_crossing', 'boundary'][l] for l in labels]
+            else:
+                info['vectors'] = []
+                info['labels'] = []
+                info['gt_map_names'] = []
+            
+            # ============================================================
+            # OBJECT ANNOTATIONS - FIXED CATEGORY MAPPING
+            # ============================================================
+            annotations = [nusc.get('sample_annotation', token) for token in sample['anns']]
+            
+            gt_boxes = []
+            gt_names = []
+            gt_velocities = []
+            num_lidar_pts = []
+            num_radar_pts = []
+            valid_flags = []
+            
+            for ann in annotations:
+                full_category = ann['category_name']
+                
+                # Map to simplified category name
+                if full_category not in CATEGORY_MAPPING:
+                    continue
+                
+                category = CATEGORY_MAPPING[full_category]
+                
+                # Get box
+                box = nusc.get_box(ann['token'])
+                
+                # Transform: Global -> Ego -> Lidar
+                box.translate(-np.array(pose_record['translation']))
+                box.rotate(Quaternion(pose_record['rotation']).inverse)
+                box.translate(-np.array(cs_record['translation']))
+                box.rotate(Quaternion(cs_record['rotation']).inverse)
+                
+                gt_boxes.append([
+                    box.center[0], box.center[1], box.center[2],
+                    box.wlh[0], box.wlh[1], box.wlh[2],
+                    box.orientation.yaw_pitch_roll[0]
+                ])
+                gt_names.append(category)
+                
+                # Velocity
+                velocity = nusc.box_velocity(ann['token'])
+                if velocity is None or np.isnan(velocity).any():
+                    velocity = np.array([0.0, 0.0])
+                else:
+                    velocity = velocity[:2]
+                gt_velocities.append(velocity)
+                
+                # Point counts
+                num_lidar_pts.append(ann.get('num_lidar_pts', 0))
+                num_radar_pts.append(ann.get('num_radar_pts', 0))
+                valid_flags.append((ann.get('num_lidar_pts', 0) + ann.get('num_radar_pts', 0)) > 0)
+            
+            # Store as numpy arrays
+            info['gt_boxes'] = np.array(gt_boxes, dtype=np.float32) if len(gt_boxes) > 0 else np.zeros((0, 7), dtype=np.float32)
+            info['gt_names'] = np.array(gt_names) if len(gt_names) > 0 else np.array([])
+            
+            # ADD THIS: Generate object segmentation mask
+            point_cloud_range = [-30.0, -15.0, -10.0, 30.0, 15.0, 10.0]
+            info['gt_object_seg_mask'] = generate_object_seg_mask(
+                info['gt_boxes'], 
+                info['gt_names'], 
+                bev_size=(200, 400),
+                pc_range=point_cloud_range
+            )
+            
+            info['gt_velocity'] = np.array(gt_velocities, dtype=np.float32) if len(gt_velocities) > 0 else np.zeros((0, 2), dtype=np.float32)
+            info['num_lidar_pts'] = np.array(num_lidar_pts, dtype=np.int32) if len(num_lidar_pts) > 0 else np.zeros(0, dtype=np.int32)
+            info['num_radar_pts'] = np.array(num_radar_pts, dtype=np.int32) if len(num_radar_pts) > 0 else np.zeros(0, dtype=np.int32)
+            info['valid_flag'] = np.array(valid_flags, dtype=bool) if len(valid_flags) > 0 else np.zeros(0, dtype=bool)
+            
+            scene_infos.append(info)
+            
+            # Next sample
+            sample_token = sample['next']
+        
+        # Fill temporal links
+        for i in range(len(scene_infos)):
+            if i > 0:
+                scene_infos[i]['prev'] = scene_infos[i-1]['token']
+                scene_infos[i]['prev_bev_exists'] = True
+            else:
+                scene_infos[i]['prev'] = ''
+                scene_infos[i]['prev_bev_exists'] = False
+            
+            if i < len(scene_infos) - 1:
+                scene_infos[i]['next'] = scene_infos[i+1]['token']
+            else:
+                scene_infos[i]['next'] = ''
+        
+        all_infos.extend(scene_infos)
+    
+    return all_infos
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--version', type=str, default='mini', choices=['mini', 'trainval'])
+    parser.add_argument('--dataroot', type=str, default='./data/nuscenes')
+    args = parser.parse_args()
+    
+    version = 'v1.0-mini' if args.version == 'mini' else 'v1.0-trainval'
+    
+    print(f"\n{'='*80}")
+    print(f"Creating Combined PKL for {version}")
+    print(f"{'='*80}\n")
+    
+    nusc = NuScenes(version=version, dataroot=args.dataroot, verbose=True)
+    
+    splits = create_splits_scenes()
+    if args.version == 'mini':
+        train_scenes = splits['mini_train']
+        val_scenes = splits['mini_val']
+    else:
+        train_scenes = splits['train']
+        val_scenes = splits['val']
+    
+    print(f"Train: {len(train_scenes)} scenes | Val: {len(val_scenes)} scenes")
+    
+    print("\nLoading HD maps...")
+    locations = ['singapore-onenorth', 'singapore-hollandvillage', 
+                'singapore-queenstown', 'boston-seaport']
+    nusc_maps = {}
+    for loc in locations:
+        try:
+            nusc_maps[loc] = NuScenesMap(dataroot=args.dataroot, map_name=loc)
+            print(f"  ✓ {loc}")
+        except:
+            print(f"  ✗ {loc}")
+    
+    # Train
+    print(f"\n{'='*80}\nTRAIN SPLIT\n{'='*80}")
+    train_infos = create_nuscenes_infos(nusc, nusc_maps, train_scenes, args)
+    
+    train_data = {'infos': train_infos, 'metadata': {'version': version, 'split': 'train'}}
+    train_path = Path(args.dataroot) / f'nuscenes_map_infos_temporal_train{"_mini" if args.version == "mini" else ""}_combined.pkl'
+    
+    with open(train_path, 'wb') as f:
+        pickle.dump(train_data, f)
+    
+    print(f"\n✅ Saved {len(train_infos)} samples to: {train_path}")
+    
+    # Val
+    print(f"\n{'='*80}\nVAL SPLIT\n{'='*80}")
+    val_infos = create_nuscenes_infos(nusc, nusc_maps, val_scenes, args)
+    
+    val_data = {'infos': val_infos, 'metadata': {'version': version, 'split': 'val'}}
+    val_path = Path(args.dataroot) / f'nuscenes_map_infos_temporal_val{"_mini" if args.version == "mini" else ""}_combined.pkl'
+    
+    with open(val_path, 'wb') as f:
+        pickle.dump(val_data, f)
+    
+    print(f"\n✅ Saved {len(val_infos)} samples to: {val_path}")
+    
+    # Statistics
+    for split_name, infos in [('Train', train_infos), ('Val', val_infos)]:
+        num_vectors = sum(1 for info in infos if len(info['vectors']) > 0)
+        num_objects = sum(1 for info in infos if len(info['gt_boxes']) > 0)
+        total_vectors = sum(len(info['vectors']) for info in infos)
+        total_objects = sum(len(info['gt_boxes']) for info in infos)
+        
+        print(f"\n📊 {split_name}: {len(infos)} samples")
+        print(f"   Maps: {num_vectors} samples ({100*num_vectors/len(infos):.1f}%), {total_vectors} total vectors")
+        print(f"   Objects: {num_objects} samples ({100*num_objects/len(infos):.1f}%), {total_objects} total objects")
+    
+    print(f"\n{'='*80}\n✅ DONE!\n{'='*80}\n")
+
+
+if __name__ == '__main__':
+    main()
