@@ -103,11 +103,11 @@ _(Comparison of Ground Truth, Plain BEV, and Masked BEV predictions - see Fig. 3
 Team
 ----
 
-*   **Kaushek Kumar T R** - _EECS Department_ - [kaushek@umich.edu](mailto:kaushek@umich.edu) 16161616
+*   **Kaushek Kumar T R** - _EECS Department_ - [kaushek@umich.edu](mailto:kaushek@umich.edu) 
     
-*   **Maithreyan Ganesh** - _Robotics Department_ - [maithgan@umich.edu](mailto:maithgan@umich.edu) 17171717
+*   **Maithreyan Ganesh** - _Robotics Department_ - [maithgan@umich.edu](mailto:maithgan@umich.edu) 
     
-*   **Shivam Udeshi** - _EECS Department_ - [sudeshi@umich.edu](mailto:sudeshi@umich.edu) 18181818
+*   **Shivam Udeshi** - _EECS Department_ - [sudeshi@umich.edu](mailto:sudeshi@umich.edu) 
     
 
 **University of Michigan, Ann Arbor** 19
