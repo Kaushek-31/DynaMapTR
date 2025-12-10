@@ -26,7 +26,6 @@ The pipeline consists of three main stages5:
 3.  **Map Decoder:** The masked features are passed to the MapTRv2 decoder to predict vector elements (lanes, dividers, crossings).
     
 
-_(Refer to Fig 1. in the report for the architecture schematic)_ 7
 
 Installation
 ------------
@@ -46,16 +45,28 @@ Installation
 
 ### Setup
 
-Bash
+```
+# Clone the repository
+git clone https://github.com/yourusername/DynaMapTR.git
+cd DynaMapTR
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   # Clone the repository  git clone https://github.com/yourusername/DynaMapTR.git  cd DynaMapTR  # Install dependencies (Based on MapTR/mmdetection3d)  pip install -r requirements.txt   `
-
+# Install dependencies (Based on MapTR/mmdetection3d)
+pip install -r requirements.txt
+```
 Dataset Preparation
 -------------------
 
 This project uses the **nuScenes** dataset. Please download the dataset and organize it as follows:
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   data/    nuscenes/      maps/      samples/      sweeps/      v1.0-trainval/   `
+```
+data/
+  canbus/
+  nuscenes/
+    maps/
+    samples/
+    sweeps/
+    v1.0-trainval/
+```
 
 **Note:** For dynamic object masking, we generate custom 3-class BEV segmentation labels derived from the annotated 3D bounding boxes8.
 
@@ -70,7 +81,10 @@ In this stage, we train the BEVFormer encoder and the SegEncodeV2 head jointly. 
 
 Bash
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   # Train the segmentation head and encoder  python tools/train.py configs/dynamaptr/stage1_segmentation.py   `
+```
+# Train the segmentation head and encoder
+bash tools/dist_train.sh  projects/configs/custom/bevformer_seg_only.py 2
+```
 
 *   **Objective:** Minimize FocalLoss + DiceLoss11.
     
@@ -83,7 +97,10 @@ We freeze the segmentation module to act as a stable filter. The masked BEV feat
 
 Bash
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   # Train the map decoder with frozen segmentation weights  python tools/train.py configs/dynamaptr/stage2_map_decoding.py --load_from work_dirs/stage1/latest.pth   `
+```
+# Train the segmentation head and encoder
+bash tools/dist_train.sh  projects/configs/custom/bevformer_seg_only.py 2
+```
 
 Results
 -------
